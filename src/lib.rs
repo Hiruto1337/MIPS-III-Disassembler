@@ -1,5 +1,3 @@
-use std::fmt::format;
-
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 
@@ -178,7 +176,7 @@ impl std::fmt::Display for CP1 {
     }
 }
 
-#[derive(Debug, FromPrimitive)]
+#[derive(Debug, FromPrimitive, Clone, Copy)]
 pub enum Register {
     Zero,
     At,
@@ -334,12 +332,19 @@ impl From<(u32, &mut [u32; 35], &mut Vec<u32>)> for Instruction {
                     ADDI|ADDIU|SLTI|SLTIU|ANDI|ORI|XORI|DADDI|DADDIU => {
                         let rt = Register::from(rt);
                         let rs = Register::from(rs);
+
+                        match opcode {
+                            ADDIU => {
+                                registers[rt as usize] = registers[rs as usize] + imm_off as u32;
+                            },
+                            _ => {}
+                        }
                         assembly = vec![opcode.to_string(), rt.to_string(), rs.to_string(), imm_off.to_string()]
                     },
                     LUI => {
                         let rt = Register::from(rt);
-
-                        assembly = vec![opcode.to_string(), rt.to_string()];
+                        registers[rt as usize] = imm_off << 16;
+                        assembly = vec![opcode.to_string(), rt.to_string(), imm_off.to_string()];
                     },
                     BEQ|BNE|BEQL|BNEL => {
                         let rs = Register::from(rs);
