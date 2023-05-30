@@ -1,45 +1,69 @@
-use binary::{Instruction};
+use binary::{COPRegister::*, COPRegisters, Instruction, Register::*, Registers, virtual_to_physical};
 
 fn main() {
     let z64_file = "sm64.z64";
     let file = std::fs::read(format!("/Users/lassegrosbol-rais/Desktop/{z64_file}"));
 
-    // Create registers
-    // registers = [0..31 = GPR, 32 = PC, 33 = LO, 34 = HI]
-    let mut registers = [0; 35];
+    // Create registers and boot N64 (initialize registers) (https://n64.readthedocs.io/#boot-process)
+    println!("Booting Nintendo 64...");
+
+    let mut registers = Registers::new();
+    registers[T3] = 0xA4000040;
+    registers[S4] = 0x1;
+    registers[S6] = 0x3F;
+    registers[SP] = 0xA4001FF0;
+
+    let mut cop_registers = COPRegisters::new();
+    cop_registers[Random] = 0x1F;
+    cop_registers[Status] = 0x34000000;
+    cop_registers[PRId] = 0xB00;
+    cop_registers[Config] = 0x6E463;
+
+    let mut jal_stack: Vec<u32> = vec![];
+
+    let mut memory = PhysicalMemory::new();
 
     if let Ok(content) = file {
-        // ROM Entry Point
-        let rom_ep = 0x1000;
-        // RAM Entry Point
-        let ram_ep = ((content[8] as u32) << 24)
-        | ((content[9] as u32) << 16)
-        | ((content[10] as u32) << 8)
-        | (content[11] as u32);
+        // Load 0x1000 bytes from ROM into SP DMEM
+        memory.sp_dmem.copy_from_slice(&content[..0x1000]);
 
-        registers[32] = ram_ep; // Set PC to RAM entry point
-        let mut jal_stack: Vec<u32> = vec![0x80247DF8];
+        // Load 1 MiB from ROM into RDRAM
+        memory.rd_ram[0x400..0x100400].copy_from_slice(&content[0..0x100000]);
+
+        // Boot ROM Entry Point
+        let boot_rom_entry = 0x40;
+
+        // Boot RAM Entry Point
+        let boot_ram_entry = 0xA4000040;
+
+        registers[PC] = boot_ram_entry;
+
         loop {
-            let rom_pc = registers[32] - ram_ep + rom_ep;
-            let big_endian: u32 = ((content[rom_pc as usize] as u32) << 24)
-                | ((content[rom_pc as usize + 1] as u32) << 16)
-                | ((content[rom_pc as usize + 2] as u32) << 8)
-                | (content[rom_pc as usize + 3] as u32);
+            let rom_pc = virtual_to_physical(registers[PC]);
+            let mut instruction = Instruction::from((&mut registers, &mut memory, &content,));
+            println!("PC: {rom_pc} - {:?}", instruction.assembly);
+            instruction.execute();
 
-            let instruction = Instruction::from((big_endian, &mut registers, &mut jal_stack)).assembly;
-
-            println!("PC: {rom_pc} - {}", instruction.join(" "));
-
-            // if instruction[0] == "JAL" {
-            //     jal_stack.push(pc);
-            //     let msbs = (pc >> 28) << 28;
-            //     let target = instruction[1].parse::<u32>().unwrap() << 2;
-            //     pc = msbs | target;
-            // } else if instruction[0] == "JR" {
-            //     pc = jal_stack.pop().unwrap();
-            // }
-
-            registers[32] += 4;
+            registers[PC] += 4;
         }
+
+        // // ROM Entry Point
+        // let rom_entry = 0x1000;
+
+        // // RAM Entry Point
+        // let ram_entry = big_endian(&content, 0x8);
+
+        // registers[PC] = ram_entry; // Set PC to RAM entry point (shouldn't boot code set entry point?)
+        // loop {
+        //     let rom_pc = registers[PC] - ram_entry + rom_entry;
+
+        //     let hex = big_endian(&content, rom_pc as usize);
+
+        //     let instruction = Instruction::from((hex, &mut registers, &mut jal_stack)).assembly;
+
+        //     println!("PC: {rom_pc} - {}", instruction.join(" "));
+
+        //     registers[PC] += 4;
+        // }
     }
 }

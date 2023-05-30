@@ -1,8 +1,66 @@
+use std::ops::{Index, IndexMut};
+
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 
-#[derive(Debug, FromPrimitive)]
+pub struct Registers {registers: [u32; 35]}
+
+impl Registers {
+    pub fn new() -> Self {
+        Registers { registers: [0; 35] }
+    }
+}
+
+impl Index<Register> for Registers {
+    type Output = u32;
+    fn index(&self, index: Register) -> &Self::Output {
+        &self.registers[index as usize]
+    }
+}
+
+impl IndexMut<Register> for Registers {
+    fn index_mut(&mut self, index: Register) -> &mut Self::Output {
+        &mut self.registers[index as usize]
+    }
+}
+
+impl std::fmt::Display for Registers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.registers)
+    }
+}
+
+pub struct COPRegisters {registers: [u32; 32]}
+
+impl COPRegisters {
+    pub fn new() -> Self {
+        COPRegisters { registers: [0; 32] }
+    }
+}
+
+impl Index<COPRegister> for COPRegisters {
+    type Output = u32;
+    fn index(&self, index: COPRegister) -> &Self::Output {
+        &self.registers[index as usize]
+    }
+}
+
+impl IndexMut<COPRegister> for COPRegisters {
+    fn index_mut(&mut self, index: COPRegister) -> &mut Self::Output {
+        &mut self.registers[index as usize]
+    }
+}
+
+pub enum COPRegister {
+    Index, Random, EntryLo0, EntryLo1, Context, PageMask, Wired, BadVAddr = 8,
+    Count, EntryHi, Compare, Status, Cause, EPC, PRId, Config,
+    LLAddr, WatchLo, WatchHi, XContext, ParityErr = 26, CacheErr, TagLo, TagHi,
+    ErrorEPC
+}
+
+#[derive(Debug, FromPrimitive, Default, Clone, Copy)]
 pub enum Opcode {
+    #[default]
     SPECIAL, REGIMM, J, JAL, BEQ, BNE, BLEZ, BGTZ,
     ADDI, ADDIU, SLTI, SLTIU, ANDI, ORI, XORI, LUI,
     COP0, COP1, COP2, BEQL = 20, BNEL, BLEZL, BGTZL,
@@ -48,8 +106,8 @@ impl From<Opcode> for Format {
     }
 }
 
-#[derive(Debug, FromPrimitive)]
-enum Funct {
+#[derive(Debug, FromPrimitive, Clone, Copy)]
+pub enum Funct {
     SLL, SRL = 2, SRA, SLLV, SRLV = 6, SRAV,
     JR, JALR, SYSCALL = 12, BREAK, SYNC = 15,
     MFHI, MTHI, MFLO, MTLO, DSLLV, DSRLV = 22, DSRAV,
@@ -190,6 +248,9 @@ pub enum Register {
     SP, // Stack pointer
     FP, // Frame pointer
     RA, // Return address (only changed by JAL and JALR instructions (and JR?))
+    PC, // Program counter
+    LO,
+    HI
 }
 
 impl From<u8> for Register {
@@ -204,212 +265,336 @@ impl std::fmt::Display for Register {
     }
 }
 
-pub struct Instruction {
-    pub assembly: Vec<String>
+#[derive(Default)]
+pub struct Instruction<'a> {
+    pub assembly: Vec<String>,
+    content: Option<&'a Vec<u8>>,
+    registers: Option<&'a mut Registers>,
+    jal_stack: Option<&'a mut Vec<u32>>,
+    opcode: Opcode,
+    funct: Option<Funct>,
+    rs: Option<Register>,
+    rt: Option<Register>,
+    rd: Option<Register>,
+    sa: Option<u8>,
+    immediate: Option<i16>,
+    target: Option<u32>,
+    sub: Option<CopRs>,
+    br: Option<CopRt>
 }
 
-impl From<(u32, &mut [u32; 35], &mut Vec<u32>)> for Instruction {
-    fn from((inst, registers, jal_stack): (u32, &mut [u32; 35], &mut Vec<u32>)) -> Self {
+impl<'a> From<(&'a mut Registers, &'a mut PhysicalMemory, &Vec<u8>)> for Instruction<'a> {
+    fn from((registers, memory, content): (&'a mut Registers, &'a mut PhysicalMemory, &Vec<u8>)) -> Self {
+        let phys_addr = registers[Register::PC];
+        let (mem_block, offset) = memory.from_physical_address(phys_addr);
+        let inst = big_endian(&mem_block, offset as usize);
+
+        let mut instruction = Instruction::default();
+        instruction.registers = Some(registers);
+        instruction.content = Some(content);
+
         if inst == 0 {
-            return Instruction {
-                assembly: vec!["NOP".to_string()]
-            }
+            instruction.assembly = vec![format!("NOP")];
+            return instruction;
         }
         
         let structure = Format::from(Opcode::from(inst));
-
-        let assembly;
-        use Format::*;
+        let assembly = &mut instruction.assembly;
 
         match structure {
-            R(opcode) => {
-                let rs = ((inst >> 21) & ((1 << 5) - 1)) as u8;
-                let rt = ((inst >> 16) & ((1 << 5) - 1)) as u8;
-                let rd = ((inst >> 11) & ((1 << 5) - 1)) as u8;
+            Format::R(opcode) => {
+                // Standard parameters
+                let rs = Register::from(((inst >> 21) & ((1 << 5) - 1)) as u8);
+                let rt = Register::from(((inst >> 16) & ((1 << 5) - 1)) as u8);
+                let rd = Register::from(((inst >> 11) & ((1 << 5) - 1)) as u8);
                 let sa = ((inst >> 6) & ((1 << 5) - 1)) as u8;
-                let funct = (inst & ((1 << 6) - 1)) as u8;
+                let funct = Funct::from((inst & ((1 << 6) - 1)) as u8);
+                let offset = (inst << 16) >> 16 as u32;
+
+                // COP parameters
+                let sub = CopRs::from(rs as u8);
+                let br = CopRt::from(rt as u8);
+                let fmt = CopRs::from(rs as u8);
+                let fs = Register::from(rd);
+                let fd = Register::from(sa);
+                let cop_funct = CP1::from(funct as u8);
+
+                // Set instruction parameters
+                instruction.opcode = opcode;
+                instruction.rs = Some(rs);
+                instruction.rt = Some(rt);
+                instruction.rd = Some(rd);
+                instruction.sa = Some(sa);
+                instruction.funct = Some(funct);
 
                 match opcode {
                     Opcode::SPECIAL => {
-                        let rs = Register::from(rs);
-                        let rt = Register::from(rt);
-                        let rd = Register::from(rd);
-                        let funct = Funct::from(funct);
                         use Funct::*;
-
                         match funct {
-                            SLL|SRL|SRA|DSLL|DSRL|DSRA|DSLL32|DSRL32|DSRA32 => {
-                                assembly = vec![funct.to_string(), rd.to_string(), rt.to_string(), sa.to_string()];
-                            },
-                            SLLV|SRLV|SRAV|DSLLV|DSRLV|DSRAV => {
-                                assembly = vec![funct.to_string(), rd.to_string(), rt.to_string(), rs.to_string()];
-                            },
-                            JR|JALR|MTHI|MTLO => {
-                                // JALR has two formats?
-                                assembly = vec![funct.to_string(), rs.to_string()];
-                            },
-                            SYSCALL|BREAK|SYNC => {
-                                assembly = vec![funct.to_string()];
-                            },
-                            MFHI|MFLO => {
-                                assembly = vec![funct.to_string(), rd.to_string()];
-                            },
-                            MULT|MULTU|DIV|DIVU|DMULT|DMULTU|DDIV|DDIVU|TGE|TGEU|TLT|TLTU|TEQ|TNE => {
-                                assembly = vec![funct.to_string(), rs.to_string(), rt.to_string()];
-                            },
-                            ADD|ADDU|SUB|SUBU|AND|OR|XOR|NOR|SLT|SLTU|DADD|DADDU|DSUB|DSUBU => {
-                                assembly = vec![funct.to_string(), rd.to_string(), rs.to_string(), rt.to_string()];
-                            }
+                            SLL|SRL|SRA|DSLL|DSRL|DSRA|DSLL32|DSRL32|DSRA32 => *assembly = vec![funct.to_string(), rd.to_string(), rt.to_string(), sa.to_string()],
+
+                            SLLV|SRLV|SRAV|DSLLV|DSRLV|DSRAV => *assembly = vec![funct.to_string(), rd.to_string(), rt.to_string(), rs.to_string()],
+
+                            JR|JALR|MTHI|MTLO => *assembly = vec![funct.to_string(), rs.to_string()],
+
+                            SYSCALL|BREAK|SYNC => *assembly = vec![funct.to_string()],
+
+                            MFHI|MFLO => *assembly = vec![funct.to_string(), rd.to_string()],
+
+                            MULT|MULTU|DIV|DIVU|DMULT|DMULTU|DDIV|DDIVU|TGE|TGEU|TLT|TLTU|TEQ|TNE => *assembly = vec![funct.to_string(), rs.to_string(), rt.to_string()],
+
+                            ADD|ADDU|SUB|SUBU|AND|OR|XOR|NOR|SLT|SLTU|DADD|DADDU|DSUB|DSUBU => *assembly = vec![funct.to_string(), rd.to_string(), rs.to_string(), rt.to_string()],
                         }
                     },
                     _ => {
                         // Opcode is a COP-function
-                        match rs {
+                        match rs as u8 {
                             val if val < 16 => {
-                                let sub = CopRs::from(rs);
                                 use CopRs::*;
                                 match sub {
                                     MT | MF | CT | CF | DMT | DMF => {
                                         // Movement of either words or control
-                                        let rt = Register::from(rt);
-                                        let rd = Register::from(rd);
-        
-                                        assembly = vec![opcode.to_string(), sub.to_string(), rt.to_string(), rd.to_string()];
+                                        *assembly = vec![sub.to_string(), opcode.to_string(), rt.to_string(), rd.to_string()];
                                     },
                                     BC => {
                                         // Branch
-                                        let br = CopRt::from(rt);
-                                        let offset = (inst & ((1 << 16) - 1)) as u32;
-        
-                                        assembly = vec![opcode.to_string(), br.to_string(), offset.to_string()];
+                                        use CopRt::*;
+                                        match br {
+                                            BCT => *assembly = vec![format!("B"), opcode.to_string(), format!("T"), offset.to_string()],
+                                            BCF => *assembly = vec![format!("B"), opcode.to_string(), format!("F"), offset.to_string()],
+                                            BCTL => *assembly = vec![format!("B"), opcode.to_string(), format!("TL"), offset.to_string()],
+                                            BCFL => *assembly = vec![format!("B"), opcode.to_string(), format!("FL"), offset.to_string()]
+                                        }
                                     },
                                     S | D | W | L => {
                                         // Floating point convertion
-                                        let fmt = CopRs::from(rs);
-                                        let fs = Register::from(rd);
-                                        let fd = Register::from(sa);
-                                        let funct = CP1::from(funct);
-        
-                                        assembly = vec![funct.to_string(), fmt.to_string(), fd.to_string(), fs.to_string()];
+                                        *assembly = vec![cop_funct.to_string(), fmt.to_string(), fd.to_string(), fs.to_string()];
                                     }
                                 }
+
+                                // TO-DO: Insert R-type values into "instruction"
                             },
-                            _ => {
+                            val => match opcode {
                                 // It is a COP operation
-                                match opcode {
-                                    Opcode::COP0 => {
-                                        let funct = CP0::from(funct);
-                                        assembly = vec![funct.to_string()];
-                                    },
-                                    Opcode::COP1 => {
-                                        let funct = CP1::from(funct);
-                                        assembly = vec![funct.to_string()];
-                                    }
-                                    _ => {
-                                        assembly = vec!["COP2".to_string()];
-                                    }
+                                Opcode::COP0 => {
+                                    let funct = CP0::from(funct as u8);
+                                    *assembly = vec![funct.to_string()];
+                                },
+                                Opcode::COP1 => {
+                                    let funct = CP1::from(funct as u8);
+                                    *assembly = vec![funct.to_string()];
+                                }
+                                _ => {
+                                    // TO-DO: SERIOUSLY NEEDS SPECIFICITY
+                                    *assembly = vec!["COP2".to_string()];
                                 }
                             }
                         }
                     }
                 }
             },
-            I(opcode) => {
-                let rs = ((inst >> 21) & ((1 << 5) - 1)) as u8;
-                let rt = ((inst >> 16) & ((1 << 5) - 1)) as u8;
-                let imm_off = inst & ((1 << 16) - 1);
+            Format::I(opcode) => {
+                let rs = Register::from(((inst >> 21) & ((1 << 5) - 1)) as u8);
+                let rt = Register::from(((inst >> 16) & ((1 << 5) - 1)) as u8);
+                let sub = RegimmRt::from(rt as u8);
+                let immediate = (inst & ((1 << 16) - 1)) as i16;
                 use Opcode::*;
                 match opcode {
                     LB|LBU|LH|LHU|LW|LWL|LWR|SB|
                     SH|SW|SWL|SWR|LD|LDL|LDR|LL|
                     LLD|LWU|SC|SCD|SD|SDL|SDR|LWC1|
-                    SWC1|LDC1|SDC1|SWC2|LWC2 => {
-                        let rt = Register::from(rt);
-                        let base = Register::from(rs);
+                    SWC1|LDC1|SDC1|SWC2|LWC2 => *assembly = vec![opcode.to_string(), rt.to_string(), format!("{immediate}({rs})")],
 
-                        assembly = vec![opcode.to_string(), rt.to_string(), format!("{imm_off}({base})")];
-                    },
-                    ADDI|ADDIU|SLTI|SLTIU|ANDI|ORI|XORI|DADDI|DADDIU => {
-                        let rt = Register::from(rt);
-                        let rs = Register::from(rs);
+                    ADDI|ADDIU|SLTI|SLTIU|ANDI|ORI|XORI|DADDI|DADDIU => *assembly = vec![opcode.to_string(), rt.to_string(), rs.to_string(), immediate.to_string()],
 
-                        match opcode {
-                            ADDIU => {
-                                registers[rt as usize] = registers[rs as usize] + imm_off as u32;
-                            },
-                            _ => {}
-                        }
-                        assembly = vec![opcode.to_string(), rt.to_string(), rs.to_string(), imm_off.to_string()]
-                    },
-                    LUI => {
-                        let rt = Register::from(rt);
-                        registers[rt as usize] = imm_off << 16;
-                        assembly = vec![opcode.to_string(), rt.to_string(), imm_off.to_string()];
-                    },
-                    BEQ|BNE|BEQL|BNEL => {
-                        let rs = Register::from(rs);
-                        let rt = Register::from(rt);
+                    LUI => *assembly = vec![opcode.to_string(), rt.to_string(), format!("0x{:x}", immediate)],
 
-                        assembly = vec![opcode.to_string(), rs.to_string(), rt.to_string(), imm_off.to_string()];
-                    },
-                    BLEZ|BGTZ|BLEZL|BGTZL => {
-                        let rs = Register::from(rs);
+                    BEQ|BNE|BEQL|BNEL => *assembly = vec![opcode.to_string(), rs.to_string(), rt.to_string(), immediate.to_string()],
 
-                        assembly = vec![opcode.to_string(), rs.to_string(), imm_off.to_string()];
-                    },
+                    BLEZ|BGTZ|BLEZL|BGTZL => *assembly = vec![opcode.to_string(), rs.to_string(), immediate.to_string()],
+
                     REGIMM => {
-                        let rs = Register::from(rs);
-                        let sub = RegimmRt::from(rt);
-                        use RegimmRt::*;
+                        *assembly = vec![sub.to_string(), rs.to_string(), immediate.to_string()];
 
-                        match sub {
-                            BLTZ|BGEZ|BLTZAL|BGEZAL|BLTZL|BGEZL|BLTZALL|BGEZALL|
-                            TGEI|TGEIU|TLTI|TLTIU|TEQI|TNEI => {
-                                let rs = Register::from(rs);
-
-                                assembly = vec![sub.to_string(), rs.to_string(), imm_off.to_string()];
-                            }
-                        }
+                        // use RegimmRt::*;
+                        // match sub {
+                        //     BLTZ|BGEZ|BLTZAL|BGEZAL|BLTZL|BGEZL|BLTZALL|BGEZALL|
+                        //     TGEI|TGEIU|TLTI|TLTIU|TEQI|TNEI => {
+                        //         let rs = Register::from(rs);
+                        //     }
+                        // }
                     },
-                    _ => {
-                        assembly = vec![opcode.to_string(), format!("Unknown I-type instruction. Hex: {:x}", inst)];
-                    }
+                    _ => *assembly = vec![opcode.to_string(), format!("Unknown I-type instruction. Hex: {:x}", inst)]
                 }
             },
-            J(opcode) => {
-                let opcode = opcode.to_string();
-                let target = ((inst & ((1 << 26) - 1)) as u32).to_string();
-
-                assembly = vec![opcode, target];
+            Format::J(opcode) => {
+                let target = (inst << 6) >> 4;
+                *assembly = vec![opcode.to_string(), target.to_string()];
+                instruction.target = Some(target);
             }
         }
 
-        Instruction {
-            assembly
-        }
+        instruction
     }
 }
 
-// Unit tests
-#[cfg(test)]
-mod tests {
-    use crate::Instruction;
+impl<'a> std::fmt::Display for Instruction<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.assembly.join(" "))
+    }
+}
 
-    #[test]
-    fn test_opcodes() {
-        let hex_codes = vec![
-            0x012A4020, // ADD t0 t1 t2
-            0x21280069, // ADDI t0 t1 0x69
-        ];
+impl<'a> Instruction<'a> {
+    pub fn execute(&mut self) {
+        let inst_type = Format::from(self.opcode);
+        let content = self.content.take().unwrap();
+        let registers = self.registers.take().unwrap();
+        let jal_stack = self.jal_stack.take().unwrap();
 
-        let instructions = vec![
-            vec!["ADD", "T0", "T1", "T2", "0"],
-            vec!["ADDI", "T0", "T1", "105"]
-        ];
+        use Opcode::*;
+        match inst_type {
+            Format::R(_) => {
+                let rs = self.rs.unwrap();
+                let rt = self.rt.unwrap();
+                let rd = self.rd.unwrap();
+                let sa = self.sa.unwrap();
+                let funct = self.funct.unwrap();
+                use Funct::*;
 
-        for i in 0..hex_codes.len() {
-            let inst = Instruction::from((hex_codes[i], &mut [0; 35], &mut vec![]));
-            assert_eq!(inst.assembly, instructions[i]);
+                match self.opcode {
+                    SPECIAL => {
+                        match funct {
+                            SLL => registers[rd] = registers[rt] << sa,
+                            SRL => registers[rd] = registers[rt] >> sa,
+                            JR => registers[Register::PC] = jal_stack.pop().unwrap(),
+                            OR => registers[rd] = registers[rs] | registers[rt],
+                            _ => {}
+                        }
+                    },
+                    _ => {}
+                }
+            },
+            Format::J(_) => {
+                let target = self.target.unwrap();
+                let new_pc = (((registers[Register::PC] + 4) >> 28) << 28) | target;
+
+                use Opcode::*;
+                use Register::*;
+                match self.opcode {
+                    JAL => {
+                        // Instruction AFTER JAL is also to be executed before jump
+                        jal_stack.push(registers[PC]);
+                        registers[RA] = registers[PC];
+                        registers[PC] = new_pc;
+                    },
+                    _ => {
+                        registers[PC] = new_pc;
+                    }
+                }
+            },
+            Format::I(_) => {
+                let rs = self.rs.unwrap();
+                let rt = self.rt.unwrap();
+                let immediate = self.immediate.unwrap();
+
+                match self.opcode {
+                    ADDI => match immediate as i32 {
+                        val if val < 0 => match registers[rs].checked_sub(val.abs() as u32) {
+                            Some(result) => registers[rt] = result,
+                            None => println!("Execute exception... (Subtract overflow)")
+                        },
+                        val => match registers[rs].checked_add(val as u32) {
+                            Some(result) => registers[rt] = result,
+                            None => println!("Execute exception... (Add with overflow)")
+                        }
+                    }
+                    ADDIU => match immediate as i32 {
+                        val if val < 0 => registers[rt] = registers[rs].overflowing_sub(val.abs() as u32).0,
+                        val => registers[rt] = registers[rs].overflowing_add(val as u32).0
+                    }
+                    ANDI => registers[rt] = registers[rs] & (((immediate as u32) << 16) >> 16),
+                    ORI => registers[rt] = registers[rs] | immediate as u32,
+                    SLTI => registers[rt] = ((registers[rs] as i32) < (immediate as i32)) as u32,
+                    XORI => registers[rt] = registers[rs] ^ (((immediate as u32) << 16) >> 16),
+                    LUI => registers[rt] = (immediate as u32) << 16,
+                    BNE => if registers[rs] != registers[rt] {
+                        match (immediate as i32) << 2 {
+                            val if val < 0 => registers[Register::PC] -= val.abs() as u32,
+                            val => registers[Register::PC] += val as u32
+                        }
+                    },
+                    BEQL => if registers[rs] == registers[rt] {
+                        // Execute delay instruction
+                        registers[Register::PC] += 4;
+                        let mut delay_instruction = Instruction::from((registers, memory, content));
+                        delay_instruction.execute();
+
+                        let registers = delay_instruction.return_mut_registers();
+
+                        // Update PC
+                        registers[Register::PC] -= 4;
+                        match (immediate as i32) << 2 {
+                            val if val < 0 => registers[Register::PC] -= val.abs() as u32,
+                            val => registers[Register::PC] += val as u32
+                        }
+                    } else {
+                        // Skip delay instruction
+                        registers[Register::PC] += 4;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn return_mut_registers(&mut self) -> &mut Registers {
+        self.registers.take().unwrap()
+    }
+}
+
+// Convert four bytes into a single word
+pub fn big_endian(content: &Vec<u8>, rom_pc: usize) -> u32 {
+    ((content[rom_pc as usize] as u32) << 24)
+        | ((content[rom_pc as usize + 1] as u32) << 16)
+        | ((content[rom_pc as usize + 2] as u32) << 8)
+        | (content[rom_pc as usize + 3] as u32)
+}
+
+// Convert a virtual address into a physical address
+pub fn virtual_to_physical(virtual_address: u32) -> u32 {
+    match virtual_address {
+        addr if addr < 0x7FFFFFFF => addr, // KUSEG
+        addr if addr < 0x9FFFFFFF => addr - 0x80000000, // KSEG0
+        addr if addr < 0xBFFFFFFF => addr - 0xA0000000, // KSEG1
+        addr if addr < 0xDFFFFFFF => addr, // KSSEG
+        addr => addr // KSEG3
+    }
+}
+
+// Get the corresponding memory segment from the physical address
+pub fn physical_to_memory(physical_address: u32) {
+
+}
+
+pub struct PhysicalMemory {
+    rd_ram: Vec<u8>, // 0x0 - 0x3FFFFF
+    sp_dmem: Vec<u8>, // 0x4000000 - 0x4000FFF
+    sp_imem: Vec<u8>, // 0x4001000 - 0x4001FFF
+    jal_stack: Vec<u32>
+}
+
+impl PhysicalMemory {
+    pub fn new() -> Self {
+        PhysicalMemory {
+            rd_ram: vec![0; 0x3FFFFF],
+            sp_dmem: vec![0; 0x1000],
+            sp_imem: vec![0; 0x1000],
+            jal_stack: vec![]
+        }
+    }
+
+    pub fn from_physical_address(&mut self, physical_address: u32) -> (&mut Vec<u8>, u32) {
+        match physical_address {
         }
     }
 }
