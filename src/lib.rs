@@ -154,7 +154,7 @@ impl std::fmt::Display for RegimmRt {
     }
 }
 
-#[derive(Debug, FromPrimitive)]
+#[derive(Debug, FromPrimitive, Clone, Copy)]
 enum CopRs {
     MF, DMF, CF, MT = 4, DMT, CT,
     BC = 8,
@@ -177,7 +177,7 @@ impl std::fmt::Display for CopRs {
     }
 }
 
-#[derive(Debug, FromPrimitive)]
+#[derive(Debug, FromPrimitive, Clone, Copy)]
 enum CopRt {
     BCF, BCT, BCFL, BCTL
 }
@@ -213,7 +213,7 @@ impl std::fmt::Display for CP0 {
     }
 }
 
-#[derive(Debug, FromPrimitive)]
+#[derive(Debug, FromPrimitive, Clone)]
 enum CP1 {
     ADD, SUB, MUL, DIV, SQRT, ABS, MOV, NEG,
     RoundL, TruncL, CeilL, FloorL, RoundW, TruncW, CeilW, FloorW,
@@ -268,10 +268,9 @@ impl std::fmt::Display for Register {
 #[derive(Default)]
 pub struct Instruction<'a> {
     pub assembly: Vec<String>,
-    content: Option<&'a Vec<u8>>,
+    memory: Option<&'a mut PhysicalMemory>,
     registers: Option<&'a mut Registers>,
-    jal_stack: Option<&'a mut Vec<u32>>,
-    opcode: Opcode,
+    opcode: Option<Opcode>,
     funct: Option<Funct>,
     rs: Option<Register>,
     rt: Option<Register>,
@@ -280,18 +279,22 @@ pub struct Instruction<'a> {
     immediate: Option<i16>,
     target: Option<u32>,
     sub: Option<CopRs>,
-    br: Option<CopRt>
+    br: Option<CopRt>,
+    fmt: Option<CopRs>,
+    fs: Option<Register>,
+    fd: Option<Register>,
+    cop0_funct: Option<CP0>,
+    cop1_funct: Option<CP1>
 }
 
-impl<'a> From<(&'a mut Registers, &'a mut PhysicalMemory, &Vec<u8>)> for Instruction<'a> {
-    fn from((registers, memory, content): (&'a mut Registers, &'a mut PhysicalMemory, &Vec<u8>)) -> Self {
-        let phys_addr = registers[Register::PC];
+impl<'a> From<(&'a mut Registers, &'a mut PhysicalMemory)> for Instruction<'a> {
+    fn from((registers, memory): (&'a mut Registers, &'a mut PhysicalMemory)) -> Self {
+        let phys_addr = virtual_to_physical(registers[Register::PC]);
         let (mem_block, offset) = memory.from_physical_address(phys_addr);
         let inst = big_endian(&mem_block, offset as usize);
 
         let mut instruction = Instruction::default();
         instruction.registers = Some(registers);
-        instruction.content = Some(content);
 
         if inst == 0 {
             instruction.assembly = vec![format!("NOP")];
@@ -311,16 +314,8 @@ impl<'a> From<(&'a mut Registers, &'a mut PhysicalMemory, &Vec<u8>)> for Instruc
                 let funct = Funct::from((inst & ((1 << 6) - 1)) as u8);
                 let offset = (inst << 16) >> 16 as u32;
 
-                // COP parameters
-                let sub = CopRs::from(rs as u8);
-                let br = CopRt::from(rt as u8);
-                let fmt = CopRs::from(rs as u8);
-                let fs = Register::from(rd);
-                let fd = Register::from(sa);
-                let cop_funct = CP1::from(funct as u8);
-
                 // Set instruction parameters
-                instruction.opcode = opcode;
+                instruction.opcode = Some(opcode);
                 instruction.rs = Some(rs);
                 instruction.rt = Some(rt);
                 instruction.rd = Some(rd);
@@ -350,6 +345,8 @@ impl<'a> From<(&'a mut Registers, &'a mut PhysicalMemory, &Vec<u8>)> for Instruc
                         // Opcode is a COP-function
                         match rs as u8 {
                             val if val < 16 => {
+                                let sub = CopRs::from(rs as u8);
+                                instruction.sub = Some(sub);
                                 use CopRs::*;
                                 match sub {
                                     MT | MF | CT | CF | DMT | DMF => {
@@ -358,6 +355,8 @@ impl<'a> From<(&'a mut Registers, &'a mut PhysicalMemory, &Vec<u8>)> for Instruc
                                     },
                                     BC => {
                                         // Branch
+                                        let br = CopRt::from(rt as u8);
+                                        instruction.br = Some(br);
                                         use CopRt::*;
                                         match br {
                                             BCT => *assembly = vec![format!("B"), opcode.to_string(), format!("T"), offset.to_string()],
@@ -368,20 +367,29 @@ impl<'a> From<(&'a mut Registers, &'a mut PhysicalMemory, &Vec<u8>)> for Instruc
                                     },
                                     S | D | W | L => {
                                         // Floating point convertion
-                                        *assembly = vec![cop_funct.to_string(), fmt.to_string(), fd.to_string(), fs.to_string()];
+                                        let fmt = CopRs::from(rs as u8);
+                                        let fs = Register::from(rd);
+                                        let fd = Register::from(sa);
+                                        let cop1_funct = CP1::from(funct as u8);
+
+                                        instruction.fmt = Some(fmt);
+                                        instruction.fs = Some(fs);
+                                        instruction.fd = Some(fd);
+                                        instruction.cop1_funct = Some(cop1_funct.to_owned());
+                                        *assembly = vec![cop1_funct.to_string(), fmt.to_string(), fd.to_string(), fs.to_string()];
                                     }
                                 }
-
-                                // TO-DO: Insert R-type values into "instruction"
                             },
-                            val => match opcode {
+                            _ => match opcode {
                                 // It is a COP operation
                                 Opcode::COP0 => {
-                                    let funct = CP0::from(funct as u8);
+                                    let cop0_funct = CP0::from(funct as u8);
+                                    instruction.cop0_funct = Some(cop0_funct);
                                     *assembly = vec![funct.to_string()];
                                 },
                                 Opcode::COP1 => {
-                                    let funct = CP1::from(funct as u8);
+                                    let cop1_funct = CP1::from(funct as u8);
+                                    instruction.cop1_funct = Some(cop1_funct);
                                     *assembly = vec![funct.to_string()];
                                 }
                                 _ => {
@@ -446,14 +454,19 @@ impl<'a> std::fmt::Display for Instruction<'a> {
 
 impl<'a> Instruction<'a> {
     pub fn execute(&mut self) {
-        let inst_type = Format::from(self.opcode);
-        let content = self.content.take().unwrap();
+        if let None = self.opcode {
+            return;
+        }
+
+        let opcode = self.opcode.unwrap();
+        
+        let inst_type = Format::from(opcode);
         let registers = self.registers.take().unwrap();
-        let jal_stack = self.jal_stack.take().unwrap();
+        let memory = self.memory.take().unwrap();
 
         use Opcode::*;
         match inst_type {
-            Format::R(_) => {
+            Format::R(opcode) => {
                 let rs = self.rs.unwrap();
                 let rt = self.rt.unwrap();
                 let rd = self.rd.unwrap();
@@ -461,17 +474,101 @@ impl<'a> Instruction<'a> {
                 let funct = self.funct.unwrap();
                 use Funct::*;
 
-                match self.opcode {
+                match opcode {
                     SPECIAL => {
                         match funct {
                             SLL => registers[rd] = registers[rt] << sa,
                             SRL => registers[rd] = registers[rt] >> sa,
-                            JR => registers[Register::PC] = jal_stack.pop().unwrap(),
+                            JR => registers[Register::PC] = memory.jal_stack.pop().unwrap(),
                             OR => registers[rd] = registers[rs] | registers[rt],
                             _ => {}
                         }
                     },
-                    _ => {}
+                    _ => {
+                        // COP
+                        match rs as u8 {
+                            val if val < 16 => {
+                                let sub = self.sub.unwrap();
+                                use CopRs::*;
+                                match sub {
+                                    MT => {},
+                                    MF => {},
+                                    CT => {},
+                                    CF => {},
+                                    DMT => {},
+                                    DMF => {}
+                                    BC => {
+                                        let br = self.br.unwrap();
+                                        use CopRt::*;
+                                        match br {
+                                            BCT => {},
+                                            BCF => {},
+                                            BCTL => {},
+                                            BCFL => {}
+                                        }
+                                    },
+                                    S => {},
+                                    D => {},
+                                    W => {},
+                                    L => {}
+                                }
+                            },
+                            _ => {
+                                use CP0::*;
+                                use CP1::*;
+                                match opcode {
+                                    Opcode::COP0 => match self.cop0_funct.take().unwrap() {
+                                        TLBR => {},
+                                        TLBP => {},
+                                        TLBWI => {},
+                                        TLBWR => {},
+                                        ERET => {}
+                                    },
+                                    Opcode::COP1 => match self.cop1_funct.take().unwrap() {
+                                        ADD => {},
+                                        SUB => {},
+                                        MUL => {},
+                                        DIV => {},
+                                        SQRT => {},
+                                        ABS => {},
+                                        MOV => {},
+                                        NEG => {},
+                                        RoundL => {},
+                                        TruncL => {},
+                                        CeilL => {},
+                                        FloorL => {},
+                                        RoundW => {},
+                                        TruncW => {},
+                                        CeilW => {},
+                                        FloorW => {},
+                                        CvtS => {},
+                                        CvtD => {},
+                                        CvtW => {},
+                                        CvtL => {},
+                                        CF => {},
+                                        CUn => {},
+                                        CEq => {},
+                                        CUeq => {},
+                                        COlt => {},
+                                        CUlt => {},
+                                        COle => {},
+                                        CUle => {},
+                                        CSf => {},
+                                        CNgle => {},
+                                        CSeq => {},
+                                        CNgl => {},
+                                        CLt => {},
+                                        CNge => {},
+                                        CLe => {},
+                                        CNgt => {}
+                                    }
+                                    _ => {
+                                        // TO-DO: SERIOUSLY NEEDS SPECIFICITY
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             },
             Format::J(_) => {
@@ -480,10 +577,10 @@ impl<'a> Instruction<'a> {
 
                 use Opcode::*;
                 use Register::*;
-                match self.opcode {
+                match opcode {
                     JAL => {
                         // Instruction AFTER JAL is also to be executed before jump
-                        jal_stack.push(registers[PC]);
+                        memory.jal_stack.push(registers[PC]);
                         registers[RA] = registers[PC];
                         registers[PC] = new_pc;
                     },
@@ -497,7 +594,7 @@ impl<'a> Instruction<'a> {
                 let rt = self.rt.unwrap();
                 let immediate = self.immediate.unwrap();
 
-                match self.opcode {
+                match opcode {
                     ADDI => match immediate as i32 {
                         val if val < 0 => match registers[rs].checked_sub(val.abs() as u32) {
                             Some(result) => registers[rt] = result,
@@ -526,7 +623,7 @@ impl<'a> Instruction<'a> {
                     BEQL => if registers[rs] == registers[rt] {
                         // Execute delay instruction
                         registers[Register::PC] += 4;
-                        let mut delay_instruction = Instruction::from((registers, memory, content));
+                        let mut delay_instruction = Instruction::from((registers, memory));
                         delay_instruction.execute();
 
                         let registers = delay_instruction.return_mut_registers();
@@ -553,34 +650,29 @@ impl<'a> Instruction<'a> {
 }
 
 // Convert four bytes into a single word
-pub fn big_endian(content: &Vec<u8>, rom_pc: usize) -> u32 {
-    ((content[rom_pc as usize] as u32) << 24)
-        | ((content[rom_pc as usize + 1] as u32) << 16)
-        | ((content[rom_pc as usize + 2] as u32) << 8)
-        | (content[rom_pc as usize + 3] as u32)
+pub fn big_endian(content: &Vec<u8>, offset: usize) -> u32 {
+    ((content[offset as usize] as u32) << 24)
+        | ((content[offset as usize + 1] as u32) << 16)
+        | ((content[offset as usize + 2] as u32) << 8)
+        | (content[offset as usize + 3] as u32)
 }
 
 // Convert a virtual address into a physical address
 pub fn virtual_to_physical(virtual_address: u32) -> u32 {
     match virtual_address {
-        addr if addr < 0x7FFFFFFF => addr, // KUSEG
-        addr if addr < 0x9FFFFFFF => addr - 0x80000000, // KSEG0
-        addr if addr < 0xBFFFFFFF => addr - 0xA0000000, // KSEG1
-        addr if addr < 0xDFFFFFFF => addr, // KSSEG
+        addr if addr < 0x80000000 => addr, // KUSEG
+        addr if addr < 0xA0000000 => addr - 0x80000000, // KSEG0
+        addr if addr < 0xC0000000 => addr - 0xA0000000, // KSEG1
+        addr if addr < 0xE0000000 => addr, // KSSEG
         addr => addr // KSEG3
     }
 }
 
-// Get the corresponding memory segment from the physical address
-pub fn physical_to_memory(physical_address: u32) {
-
-}
-
 pub struct PhysicalMemory {
-    rd_ram: Vec<u8>, // 0x0 - 0x3FFFFF
-    sp_dmem: Vec<u8>, // 0x4000000 - 0x4000FFF
-    sp_imem: Vec<u8>, // 0x4001000 - 0x4001FFF
-    jal_stack: Vec<u32>
+    pub rd_ram: Vec<u8>, // 0x0 - 0x3FFFFF
+    pub sp_dmem: Vec<u8>, // 0x4000000 - 0x4000FFF
+    pub sp_imem: Vec<u8>, // 0x4001000 - 0x4001FFF
+    pub jal_stack: Vec<u32>
 }
 
 impl PhysicalMemory {
@@ -595,6 +687,10 @@ impl PhysicalMemory {
 
     pub fn from_physical_address(&mut self, physical_address: u32) -> (&mut Vec<u8>, u32) {
         match physical_address {
+            addr if addr < 0x400000 => (&mut self.rd_ram, physical_address),
+            addr if addr < 0x401000 => (&mut self.sp_dmem, physical_address - 0x400000),
+            addr if addr < 0x402000 => (&mut self.sp_imem, physical_address - 0x401000),
+            _ => (&mut self.rd_ram, physical_address)
         }
     }
 }
